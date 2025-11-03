@@ -7,6 +7,7 @@ import tensorflow as tf
 import numpy as np
 import pandas as pd
 import os
+import gc
 import time
 
 # Neural Network Components
@@ -74,9 +75,20 @@ train_ds = train_ds.cache().prefetch(buffer_size=tf.data.AUTOTUNE)
 test_ds = test_ds.cache().prefetch(buffer_size=tf.data.AUTOTUNE)
 
 number_of_classes = 4
-
+#%%
+def cleanup_memory():
+    """Liberate memory and clean up"""
+    gc.collect()  # Python garbage collection
+    # Clear TensorFlow session if using TF
+    try:
+        import tensorflow as tf
+        tf.keras.backend.clear_session()
+    except:
+        pass
+#%%
 def objective(trial):
     # Early stopping callback
+    os.system('clear')
     early_stopping = keras.callbacks.EarlyStopping(monitor ='val_loss',
                                                    min_delta = 0.001,
                                                    patience = 10, 
@@ -101,23 +113,35 @@ def objective(trial):
         config=params
     )
     
+    wandb_checkpoint = WandbModelCheckpoint(
+    filepath='/workspace/Models/best_model.keras',
+    monitor='val_loss',
+    mode='min',
+    save_best_only=True,
+    save_weights_only=False,
+    verbose=0
+    )
+    
     # Train the model with data generators
     history = model.fit(
         train_ds,
         epochs=50, 
         batch_size=batch_size,  # Use the tuned batch_size
-        verbose=1,
+        verbose=2,
         validation_data=test_ds,
         callbacks=[
             WandbMetricsLogger(log_freq=1),
-            early_stopping
+            early_stopping,
+            wandb_checkpoint
         ]
     )
-    
+    best_model = tf.keras.models.load_model('/workspace/Models/best_model.keras')
     # Finish wandb run
     run.finish()
     # Evaluate on validation set (not test set for hyperparameter optimization)
-    val_loss, val_accuracy = model.evaluate(test_ds, verbose=0)
+    val_loss, val_accuracy = best_model.evaluate(test_ds, verbose=0)
+    del model, best_model, history
+    cleanup_memory()
     return val_loss  # Optimize on validation loss
 
 study = optuna.create_study(direction = "minimize")
