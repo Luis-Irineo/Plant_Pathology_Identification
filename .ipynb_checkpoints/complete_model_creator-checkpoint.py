@@ -13,31 +13,12 @@ from tensorflow.keras.optimizers import Adam, SGD, RMSprop
 from tensorflow.keras.callbacks import EarlyStopping
 from tensorflow.keras import regularizers
 from tensorflow.keras.utils import to_categorical
-from tensorflow.keras.callbacks import EarlyStopping
 from keras import backend as K
 
 import wandb
 from wandb.integration.keras import WandbMetricsLogger, WandbModelCheckpoint
 
 warnings.filterwarnings('always')
-
-#%% WANDB function creation
-def wandb_block(params):
-    config_directory = params
-    trial_number = config_directory["name"]
-    
-    run = wandb.init(
-        settings=wandb.Settings(x_stats_sampling_interval=params['sampling_interval'], 
-                                x_disable_stats=False),
-        # set the wandb project where this run will be logged
-        name = f"Trial_{trial_number}",
-        project = config_directory['project'],
-        group = config_directory['project'],
-        # track hyperparameters and run metadata with wandb.config
-        config = config_directory
-    )
-    time.sleep(3.0)
-    return run
       
 #%% Neural Network Constructor
 class NeuralNetworkConstructor:
@@ -45,7 +26,7 @@ class NeuralNetworkConstructor:
                  downwards_activations=[None]*4, downwards_dropouts=[0.2,0.2], downwards_regularizers=[None]*4,
                  bottleneck_activations=[None]*2, bottleneck_dropout=0.2, bottleneck_regularizers=[None]*2,
                  upwards_activations=[None]*4, upwards_dropouts=[0.2,0.2], upwards_regularizers=[None]*4,
-                 classifier_activation="relu"):
+                 classifier_activation="softmax"):
         self.inputs = inputs
         self.conv_blocks = conv_blocks
         self.maxpooling_rate = maxpooling_rate
@@ -69,12 +50,14 @@ class NeuralNetworkConstructor:
     
     def selected_regularizer(self, regularizer):
         if regularizer is None:
-            selected_regularizer = "None"
+            return None
         elif regularizer == "L1L2":
-            selected_regularizer = f"keras.regularizers.{regularizer}(l1 = 1e-5, l2 = 1e-5)"
-        else:
-            selected_regularizer = f"keras.regularizers.{regularizer}(1e-5)"
-        return selected_regularizer
+            return regularizers.L1L2(l1=1e-5, l2=1e-5)
+        elif regularizer == "L1":
+            return regularizers.L1(1e-5)
+        elif regularizer == "L2":
+            return regularizers.L2(1e-5)
+        return None
         
     
     def downwards_path_iterator(self, block_inputs):
@@ -83,14 +66,13 @@ class NeuralNetworkConstructor:
         for i in range(self.complete_length):
             current_filter = self.filters*(i//self.maxpooling_rate+1)
             current_activation = self.downwards_activations[i]
-            current_regularizer = self.selected_regularizer(
-                self.downwards_regularizers[i]
-            )
+            current_regularizer = self.downwards_regularizers[i]
             x = layers.Conv2D(filters=current_filter,
                               kernel_size=(3,3),
                               padding='valid',
                               activation=current_activation,
-                              kernel_regularizer=eval(current_regularizer),
+                              kernel_regularizer=self.selected_regularizer(
+                                  current_regularizer),
                               name=f'DownConv{i+1}')(x)
             x = layers.BatchNormalization(name=f'DownBN{i+1}')(x)
             
@@ -105,20 +87,45 @@ class NeuralNetworkConstructor:
                 
         downwards_output = x
         return downwards_output
+
+    def downwards_path_iterator_no_residuals(self, block_inputs):
+        x = block_inputs
+        count=0
+        for i in range(self.complete_length):
+            current_filter = self.filters*(i//self.maxpooling_rate+1)
+            current_activation = self.downwards_activations[i]
+            current_regularizer = self.downwards_regularizers[i]
+            x = layers.Conv2D(filters=current_filter,
+                              kernel_size=(3,3),
+                              padding='valid',
+                              activation=current_activation,
+                              kernel_regularizer=self.selected_regularizer(
+                                  current_regularizer),
+                              name=f'DownConv{i+1}')(x)
+            x = layers.BatchNormalization(name=f'DownBN{i+1}')(x)
+            
+            if (i+1)%self.maxpooling_rate==0:
+                x=layers.MaxPooling2D((2,2), padding='same',
+                                      name=f'MaxPool{count+1}')(x)
+                
+                x=layers.Dropout(self.downwards_dropouts[count],
+                                 name=f'DownDO{count+1}')(x)
+                count+=1
+        downwards_output = x
+        return downwards_output
     
     def bottleneck_path_iterator(self, block_inputs):
         current_filter = self.filters*self.conv_blocks*2
         x = block_inputs
         for i in range(self.bottleneck_length):
             current_activation = self.bottleneck_activations[i]
-            current_regularizer = self.selected_regularizer(
-                self.bottleneck_regularizers[i]
-            ) 
+            current_regularizer = self.bottleneck_regularizers[i]
             x = layers.Conv2D(filters=current_filter,
                               kernel_size=(3,3),
                               padding='valid',
                               activation=current_activation,
-                              kernel_regularizer=eval(current_regularizer),
+                              kernel_regularizer=self.selected_regularizer(
+                                  current_regularizer),
                               name=f'BotConv{i+1}')(x)
             x = layers.BatchNormalization(name=f'BotBN{i+1}')(x)
         x = layers.Dropout(self.bottleneck_dropout,
@@ -132,9 +139,8 @@ class NeuralNetworkConstructor:
         x = block_inputs
         for i in range(self.complete_length):
             current_activation = self.upwards_activations[i]
-            current_regularizer = self.selected_regularizer(
-                self.upwards_regularizers[i]
-            )
+            current_regularizer = self.upwards_regularizers[i]
+            
             if i%self.maxpooling_rate==0:
                 count+=1
                 residual = self.residuals[self.conv_blocks-count]
@@ -152,7 +158,7 @@ class NeuralNetworkConstructor:
                 
                 # unimos los residuals con las activaciones actuales
                 x = layers.Concatenate(axis=-1)([x, residual])
-                x=layers.Dropout(self.downwards_dropouts[count-1],
+                x=layers.Dropout(self.upwards_dropouts[count-1],
                                  name=f'UpDO{count}')(x)
                 current_filter= current_filter//2
                 
@@ -160,14 +166,15 @@ class NeuralNetworkConstructor:
                               kernel_size=(3,3),
                               padding='valid',
                               activation=current_activation,
-                              kernel_regularizer=eval(current_regularizer),
+                              kernel_regularizer=self.selected_regularizer(
+                                  current_regularizer),
                               name=f'UpConv{i+1}')(x)
             
             x = layers.BatchNormalization(name=f'UpBN{i+1}')(x)
-        upwards_output = x
+            upwards_output = x
         return upwards_output
 
-    def complete_outputs(self):
+    def segmentation_outputs(self):
         x=self.inputs
         x=self.downwards_path_iterator(x)
         x=self.bottleneck_path_iterator(x)
@@ -179,31 +186,49 @@ class NeuralNetworkConstructor:
                         name='segmentation_map')(x)
         outputs=x
         return outputs
+        
+    def classification_outputs(self, dense_units, dense_activation, dense_dropout):
+        x=self.inputs
+        x=self.downwards_path_iterator_no_residuals(x)
+        x=self.bottleneck_path_iterator(x)
+        x=layers.GlobalAveragePooling2D()(x)
+        x = layers.Dense(dense_units, activation=dense_activation)(x)
+        x = layers.Dropout(dense_dropout)(x)
+        x = layers.Dense(self.total_categories, 
+                         activation=self.classifier_activation,
+                         name='classifier')(x)
+        outputs = x
+        return outputs
 
 # MODEL BUILDER
 class ModelBuilder:
     def __init__(self, trial, inputs, total_classes):
         # INITIAL CONFIGURATION
+        # self.activation_list = ['relu','tanh','leaky_relu','elu','silu','mish']
+        self.activation_list = ['relu','tanh']
         self.project = 'Plant_Pathology_Classifier'
         self.group = 'Mini_Train'
         self.loss = 'categorical_crossentropy'
-        self.metrics = 'val_loss'
-        self.batch_size = 25
+        self.metric = 'accuracy'
+        self.batch_size = 20
         self.sampling_interval = 20
         self.inputs=inputs
         self.total_categories = total_classes
         # PRIMARY OPTUNA SUGGESTIONS
         self.trial_number = trial
-        self.conv_blocks = trial.suggest_int('conv_blocks', 1, 5)
-        self.maxpooling_rate = trial.suggest_int('maxpooling_tate', 1, 5)
+        self.conv_blocks = trial.suggest_int('conv_blocks', 2, 3)
+        self.maxpooling_rate = trial.suggest_int('maxpooling_rate', 2, 3)
         self.total_length = self.maxpooling_rate * self.conv_blocks
-        self.bottleneck_length = trial.suggest_int('bottleneck_length', 1, 5)
+        self.bottleneck_length = trial.suggest_int('bottleneck_length', 2, 3)
         self.filters = trial.suggest_int('filters', 16, 256, step=16)
         self.complete_length = self.conv_blocks*self.maxpooling_rate
         self.bottleneck_dropout = trial.suggest_float('bottleneck_dropout', 0.1, 0.5)
+        
         self.optimizer = trial.suggest_categorical("optimizer", ["Adam", "SGD", "RMSprop", "Nadam"])
         self.classifier_activation = 'softmax'
-        
+        self.dense_units = trial.suggest_int('Dense_units', 16, 256, step=16)
+        self.dense_activation = trial.suggest_categorical('Dense_activation', self.activation_list)
+        self.dense_dropout = trial.suggest_float('Dense_dropout', 0.1, 0.5)
         # INITIALIZING THE CODER LISTS
         self.downwards_activations = [None]*self.complete_length
         self.downwards_dropouts = [None]*self.conv_blocks
@@ -217,26 +242,21 @@ class ModelBuilder:
         self.upwards_activations = [None]*self.complete_length
         self.upwards_dropouts = [None]*self.conv_blocks
         self.upwards_regularizers = [None]*self.complete_length
-        
-        
-        
+       
         # SECONDARY OPTUNA SUGGESTIONS
         for i in range(self.bottleneck_length):
-            activation_name = trial.suggest_categorical(f'BN_activation{i}', 
-                                                        ['relu','tanh','leaky_relu','elu','silu','mish'])
+            activation_name = trial.suggest_categorical(f'BN_activation{i}', self.activation_list)
             regularizer_name = trial.suggest_categorical(f'BN_regularizer{i}',
                                                         [None, 'L1L2', "L1", "L2"])
             self.bottleneck_activations[i] = activation_name
             self.bottleneck_regularizers[i] = regularizer_name
         
         for i in range(self.total_length):
-            up_activation_name = trial.suggest_categorical(f'DW_activation{i}', 
-                                                        ['relu','tanh','leaky_relu','elu','silu','mish'])
+            up_activation_name = trial.suggest_categorical(f'DW_activation{i}', self.activation_list)
             up_regularizer_name = trial.suggest_categorical(f'DW_regularizer{i}',
                                                         [None, 'L1L2', "L1", "L2"])
             
-            down_activation_name = trial.suggest_categorical(f'UW_activation{i}', 
-                                                        ['relu','tanh','leaky_relu','elu','silu','mish'])
+            down_activation_name = trial.suggest_categorical(f'UW_activation{i}', self.activation_list)
             down_regularizer_name = trial.suggest_categorical(f'UW_regularizer{i}',
                                                         [None, 'L1L2', "L1", "L2"])
             
@@ -297,59 +317,15 @@ class ModelBuilder:
         params = self.get_params(1)
         
         Neural_network_constructor = NeuralNetworkConstructor(inputs, total_categories, **params)
-        outputs = Neural_network_constructor.complete_outputs()
+        outputs = Neural_network_constructor.classification_outputs(self.dense_units, 
+                                                                    self.dense_activation,
+                                                                    self.dense_dropout)
         model = keras.Model(inputs=inputs,
                             outputs=outputs)
         model.compile(optimizer=self.optimizer,
-                     loss=self.loss,
-                     metrics=[self.metrics])
+                      loss=self.loss,
+                      metrics=[self.metric])
         return model
     
     def get_model(self):
         return self.model
-
-# IMAGE GENERATOR
-class ImageDataGenerator(tf.keras.utils.Sequence):
-    def __init__(self, dataframe, image_dir, batch_size, target_size, label_columns, shuffle=True):
-        self.dataframe = dataframe.reset_index(drop=True)
-        self.image_dir = image_dir
-        self.batch_size = batch_size
-        self.target_size = target_size
-        self.shuffle = shuffle
-        self.on_epoch_end()
-    
-    def __len__(self):
-        return int(np.ceil(len(self.dataframe) / self.batch_size))
-    
-    def __getitem__(self, index):
-        batch_indexes = self.indexes[index*self.batch_size:(index+1)*self.batch_size]
-        batch_df = self.dataframe.iloc[batch_indexes]
-        
-        X = np.zeros((len(batch_df), *self.target_size, 3))
-        y = np.zeros((len(batch_df), len(label_columns)))
-        
-        for i, (idx, row) in enumerate(batch_df.iterrows()):
-            # Load and preprocess image
-            img_path = os.path.join(self.image_dir, row[image_id_column])
-            img = self.load_and_preprocess_image(img_path)
-            X[i] = img
-            
-            # Get labels
-            y[i] = row[label_columns].values
-        
-        return X, y
-    
-    def load_and_preprocess_image(self, img_path):
-        # Load image
-        img = tf.keras.preprocessing.image.load_img(img_path, target_size=self.target_size)
-        img_array = tf.keras.preprocessing.image.img_to_array(img)
-        
-        # Normalize to [0, 1]
-        img_array = img_array / 255.0
-        
-        return img_array
-    
-    def on_epoch_end(self):
-        self.indexes = np.arange(len(self.dataframe))
-        if self.shuffle:
-            np.random.shuffle(self.indexes)

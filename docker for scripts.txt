@@ -1,0 +1,3 @@
+sudo docker run -it --name tf_scripts -v /home/lalo_nano/Tarea_6:/workspace tensorflow/tensorflow:latest-gpu bash
+cd /workspace
+python Train.py
