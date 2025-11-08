@@ -1,0 +1,12 @@
+wandb/
+
+# Ignore everything inside Models/
+Models/*
+# Ignore everything inside wandb/
+wandb/*
+# Ignore everything inside images/
+images/*
+# Ignore everything inside Deprecated_code/
+Deprecated_code/*
+
+
